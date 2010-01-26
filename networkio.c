@@ -354,7 +354,7 @@ get_bps(u_int64_t diff, struct rule * r) {
         return (u_int32_t)-1;
     }
 
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, NULL); // XXX: 2038 problem 
     t = (tv.tv_sec + 1.0e-6 * tv.tv_usec) - (r->interval.tv_sec + 1.0e-6 * r->interval.tv_usec);
 
     u_int32_t bps = (int)((diff * 8) / t);
