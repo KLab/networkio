@@ -1,5 +1,6 @@
 #define _LARGEFILE64_SOURCE
 
+#include <limits.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <time.h>
@@ -21,14 +22,13 @@
 
 #include "ganglia.h"
 
-// TODO:apr_pool_destroy
+// TODO:apr_pool_destroy, overflow 
 
 static int verv = 0;
 static const char * prog = "networkio";
 
 enum { MAXLEN = 256 };
 enum { SLEEP_TIME = 60 };
-
 
 struct iface {
     struct ipt_ip ip;
@@ -110,8 +110,8 @@ new_rule(apr_pool_t * p, const char * app) {
     r = (struct rule *)apr_palloc(p, sizeof(struct rule));
     if (!r) return NULL;
     r->app = apr_pstrdup(p, app);
-    gettimeofday(&r->interval, NULL);
     r->ifaces = apr_array_make(p, 32, sizeof(struct iface *));
+    gettimeofday(&r->interval, NULL);
     return r;
 }
 
@@ -311,7 +311,7 @@ config(const char * fname, int sleep) {
             }
             struct iface * iface = new_iface(c->p, src, smsk, dst, dmsk);
             if (!r || !iface) {
-                fprintf(stderr, "Could not create rule: %s src %s:%s dst %s:%s\n",
+                fprintf(stderr, "Cannot create rule: %s src %s:%s dst %s:%s\n",
                         app, src, smsk, dst, dmsk);
                 return 0;
             }
@@ -335,7 +335,7 @@ config(const char * fname, int sleep) {
                 }
             }
         }
-        printf("config finish ....\n");
+        puts("Configration done\n");
     }
     if (sleep) {
         conf.sleeptime = sleep;
@@ -346,19 +346,20 @@ config(const char * fname, int sleep) {
 }
 
 u_int32_t  
-get_bps(u_int64_t cur, u_int64_t pre, struct rule * r) {
+get_bps(u_int64_t diff, struct rule * r) {
     struct timeval tv;
     double t = 0.0;
-    if (cur < pre) return (u_int32_t)-1;
+    if (diff > ULONG_MAX) {
+        fprintf(stderr, "different overflow\n");
+        return (u_int32_t)-1;
+    }
 
     gettimeofday(&tv, NULL);
-    t = tv.tv_sec - r->interval.tv_sec;
-    t += 0.000001 * (tv.tv_usec - r->interval.tv_usec);
+    t = (tv.tv_sec + 1.0e-6 * tv.tv_usec) - (r->interval.tv_sec + 1.0e-6 * r->interval.tv_usec);
 
-    u_int32_t bytes = cur - pre;
-    u_int32_t bps = (int)((bytes * 8) / t);
+    u_int32_t bps = (int)((diff * 8) / t);
     if (verv >= 1) {
-        printf("%s: %3.1lf sec: receieved bytes %d\n", r->app, t, bytes);
+        printf("%s: %3.3lf sec: receieved bytes %lu\n", r->app, t, (long unsigned int)diff);
         printf(" => %lu[bps]\n", (long unsigned)bps);
     }
     memcpy(&r->interval, &tv, sizeof(struct timeval));
@@ -470,8 +471,9 @@ int do_handle() {
                                 printf("   following %s:%d\n", r->app, k);
                                 dump_ipt(&iface->ip);
                             }
-                            printf("------------------------------\n\n");
+                            puts("------------------------------\n");
                         }
+                        // XXX: rewrite, initialize and not 
                         if (!initialize) {
                             for (k=0; k<r->ifaces->nelts; ++k) {
                                 struct iface * iface = ((struct iface**)r->ifaces->elts)[k];
@@ -487,19 +489,25 @@ int do_handle() {
                                 }
                             } 
                         } else {
-                            u_int64_t cur = 0, prev = 0;
+                            u_int64_t diffbytes = 0;
                             for (k=0; k<r->ifaces->nelts; ++k) {
                                 struct iface * iface = ((struct iface**)r->ifaces->elts)[k];
                                 const struct ipt_entry * e = iptc_first_rule(chain, &handle);
                                 for ( ; e; e = iptc_next_rule(e, &handle)) {
                                     if (is_match(&e->ip, &iface->ip)) {
-                                        cur += e->counters.bcnt;
-                                        prev += iface->bcnt;
+                                        if (e->counters.bcnt >= iface->bcnt) {
+                                            diffbytes += e->counters.bcnt - iface->bcnt;
+                                        } else {
+#ifndef ULLONG_MAX
+# define ULLONG_MAX	18446744073709551615ULL
+#endif
+                                            diffbytes += ULLONG_MAX- iface->bcnt + e->counters.bcnt;
+                                        }
                                         iface->bcnt = e->counters.bcnt;
                                     }
                                 }
                             }
-                            u_int32_t bps = get_bps(cur, prev, r);
+                            u_int32_t bps = get_bps(diffbytes, r);
                             if (bps != (u_int32_t)(-1) ) {
                                 int res = gsend(r->app, bps);
                                 if (!res) return 1;
