@@ -17,14 +17,12 @@
 #include <apr_tables.h>
 #include <apr_strings.h>
 
-#include "libiptc/libiptc.h"                                                
-#include "iptables.h"                                                       
+#include "libiptc/libiptc.h"
+#include "iptables.h"
 
 #include "ganglia.h"
 
-// TODO:apr_pool_destroy, overflow 
-
-static int verv = 0;
+static int verb = 0;
 static const char * prog = "networkio";
 
 enum { MAXLEN = 256 };
@@ -33,6 +31,7 @@ enum { SLEEP_TIME = 60 };
 struct iface {
     struct ipt_ip ip;
     u_int64_t bcnt; // bytes
+    u_int64_t pcnt; // packets
 };
 
 struct rule {
@@ -100,6 +99,7 @@ new_iface(apr_pool_t * p, const char * src, const char * smsk,
     }
     memcpy(&iface->ip, &ip, sizeof(struct ipt_ip));
     iface->bcnt = 0;
+    iface->pcnt = 0;
     return iface;
 }
 
@@ -125,7 +125,7 @@ is_match(const struct ipt_ip * l, const struct ipt_ip * r) {
     return 0;
 }
 
-int 
+int
 is_table(const char * t) {
     static const char * tables [] = { "filter", "nat", "mangle" };
     int i, l;
@@ -136,7 +136,7 @@ is_table(const char * t) {
     return 0;
 }
 
-struct filter * 
+struct filter *
 new_filter(apr_pool_t * p, const char * table, const char * chain) {
     struct filter * f;
     if (!is_table(table)) {
@@ -167,10 +167,10 @@ gen_netmask(int n, char * t) {
     return 1;
 }
 
-#define IP_PARTS_NATIVE(n)			\
-    (unsigned int)((n)>>24)&0xFF,			\
-(unsigned int)((n)>>16)&0xFF,			\
-(unsigned int)((n)>>8)&0xFF,			\
+#define IP_PARTS_NATIVE(n)    \
+    (unsigned int)((n)>>24)&0xFF,  \
+(unsigned int)((n)>>16)&0xFF,   \
+(unsigned int)((n)>>8)&0xFF,    \
 (unsigned int)((n)&0xFF)
 
 #define IP_PARTS(n) IP_PARTS_NATIVE(ntohl(n))
@@ -240,10 +240,10 @@ config(const char * fname, int sleep) {
             * end = '\0';
             char table[MAXLEN], chain[MAXLEN];
             char * tag = strchr(p, ':');
-            if (!tag) { 
+            if (!tag) {
                 fprintf(stderr, "Not found user chain: %s\n", buf);
                 return 0;
-            } 
+            }
             * tag = '\0';
             strncpy(table, p+1, tag-p);
             strncpy(chain, tag+1, end-tag+1);
@@ -255,7 +255,7 @@ config(const char * fname, int sleep) {
             *(struct filter**)apr_array_push(c->filters) = f;
         } else {
             char * t = strtok(p, " ");
-            char app[MAXLEN], src[MAXLEN], smsk[MAXLEN], 
+            char app[MAXLEN], src[MAXLEN], smsk[MAXLEN],
                  dst[MAXLEN], dmsk[MAXLEN];
             static const char * zero = "0.0.0.0";
             static const char * filled = "255.255.255.255";
@@ -318,7 +318,7 @@ config(const char * fname, int sleep) {
             *(struct iface**)apr_array_push(r->ifaces) = iface;
         }
     }
-    if (verv >= 1) {
+    if (verb >= 1) {
         int i;
         apr_array_header_t * ary = c->filters;
         for (i=0; i<ary->nelts; ++i) {
@@ -345,25 +345,27 @@ config(const char * fname, int sleep) {
     return 1;
 }
 
-u_int32_t  
-get_bps(u_int64_t diff, struct rule * r) {
+u_int32_t
+get_diff(u_int64_t diff, struct rule * r, bool is_byte, const char * msg) {
     struct timeval tv;
     double t = 0.0;
+    u_int32_t cps = 0;
+
     if (diff > ULONG_MAX) {
         fprintf(stderr, "different overflow\n");
         return (u_int32_t)-1;
     }
-
-    gettimeofday(&tv, NULL); // XXX: 2038 problem 
+    gettimeofday(&tv, NULL);
     t = (tv.tv_sec + 1.0e-6 * tv.tv_usec) - (r->interval.tv_sec + 1.0e-6 * r->interval.tv_usec);
-
-    u_int32_t bps = (int)((diff * 8) / t);
-    if (verv >= 1) {
-        printf("%s: %3.3lf sec: receieved bytes %lu\n", r->app, t, (long unsigned int)diff);
-        printf(" => %lu[bps]\n", (long unsigned)bps);
+    if (is_byte) cps = (int)((diff * 8) / t);
+    else cps = (int)(diff / t);
+    if (verb >= 1) {
+        printf("%s: %3.3lf sec: receieved %s %lu\n", r->app, t, msg, (long unsigned int)diff);
+        printf(" => %lu[counter/sec]\n", (long unsigned)cps);
     }
     memcpy(&r->interval, &tv, sizeof(struct timeval));
-    return bps;
+
+    return cps;
 }
 
 /* from connstatd */
@@ -372,7 +374,6 @@ Ganglia_pool              context;
 Ganglia_metric            gmetric;
 Ganglia_udp_send_channels channel;
 Ganglia_gmond_config      gconfig;
-
 
 static void SignalHandler(int sig)
 {
@@ -384,19 +385,23 @@ static void SignalHandler(int sig)
 }
 
 /* int gsend(int m) */
-int gsend(char * app, int m)
+int gsend(const char * _app, int m, const char * postfix, const char * unit)
 {
     int  r;
     char v[8];
     sprintf(v,"%d",m);
+    char app[512];
 
+    strncpy(app, _app, 512);
+    if (postfix) {
+        strncpy(app + strlen(app), postfix, strlen(postfix));
+    }
     gmetric = Ganglia_metric_create(context);
     if(!gmetric){
         printf("Ganglia_metric_create error\n");
         return(1);
     }
-
-    r=Ganglia_metric_set(gmetric, app, v, "uint32", "bps", 
+    r=Ganglia_metric_set(gmetric, (char*)app, v, "uint32", (char*)unit, 
             GANGLIA_SLOPE_BOTH, 60, 0);
     if (r != 0) {
         switch(r){
@@ -424,7 +429,7 @@ int gsend(char * app, int m)
 
 static 
 void usage() {
-    static const char * str = 
+    static const char * str =
         "usage: %s [-d] [-f config] [-s sleep_time]\n"
         "          -d (debug mode ex. if [ -d -d -d ] are, more verbose than -d\n"
         "          -f config [default: config.ini]\n"
@@ -459,12 +464,12 @@ int do_handle() {
 
                     const struct ipt_entry * e = iptc_first_rule(chain, &handle);
                     for ( ; e; e = iptc_next_rule(e, &handle)) {
-                        if (verv >= 4) dump_ipt(&e->ip);
+                        if (verb >= 4) dump_ipt(&e->ip);
                     }
                     for (j=0; j<f->rules->nelts; ++j) {
                         struct rule * r = ((struct rule **)f->rules->elts)[j];
                         int k;
-                        if (verv >= 4) {
+                        if (verb >= 4) {
                             printf("----%s:our rule dump info----\n", r->app);
                             for (k=0; k<r->ifaces->nelts; ++k) {
                                 struct iface * iface = ((struct iface**) r->ifaces->elts)[k];
@@ -480,36 +485,54 @@ int do_handle() {
                                 const struct ipt_entry * e = iptc_first_rule(chain, &handle);
                                 for ( ; e; e = iptc_next_rule(e, &handle)) {
                                     if (is_match(&e->ip, &iface->ip)) {
-                                        if (verv >= 3) {
-                                            printf("********  %s:%d initialize to %llu\n",
-                                                    r->app, k, (u_int64_t)e->counters.bcnt);
+                                        if (verb >= 3) {
+                                            printf("********  %s:%d initialize to %llu %llu\n",
+                                                    r->app, k,
+                                                    (u_int64_t)e->counters.bcnt,
+                                                    (u_int64_t)e->counters.pcnt);
                                         }
                                         iface->bcnt = e->counters.bcnt;
+                                        iface->pcnt = e->counters.pcnt;
                                     }
                                 }
-                            } 
+                            }
                         } else {
                             u_int64_t diffbytes = 0;
+                            u_int64_t diffpackets = 0;
                             for (k=0; k<r->ifaces->nelts; ++k) {
                                 struct iface * iface = ((struct iface**)r->ifaces->elts)[k];
                                 const struct ipt_entry * e = iptc_first_rule(chain, &handle);
                                 for ( ; e; e = iptc_next_rule(e, &handle)) {
                                     if (is_match(&e->ip, &iface->ip)) {
+                                        /* bytes counter */
                                         if (e->counters.bcnt >= iface->bcnt) {
                                             diffbytes += e->counters.bcnt - iface->bcnt;
                                         } else {
 #ifndef ULLONG_MAX
-# define ULLONG_MAX	18446744073709551615ULL
+# define ULLONG_MAX            18446744073709551615ULL
 #endif
-                                            diffbytes += ULLONG_MAX- iface->bcnt + e->counters.bcnt;
+                                            diffbytes += ULLONG_MAX - iface->bcnt + e->counters.bcnt + 1;
                                         }
                                         iface->bcnt = e->counters.bcnt;
+
+                                        /* packets counter */
+                                        if (e->counters.pcnt >= iface->pcnt) {
+                                            diffpackets += e->counters.pcnt - iface->pcnt;
+                                        } else {
+                                            diffpackets += ULLONG_MAX - iface->pcnt + e->counters.pcnt + 1;
+                                        }
+                                        iface->pcnt = e->counters.pcnt;
                                     }
                                 }
                             }
-                            u_int32_t bps = get_bps(diffbytes, r);
+                            u_int32_t bps = get_diff(diffbytes, r, TRUE, "bytes");
                             if (bps != (u_int32_t)(-1) ) {
-                                int res = gsend(r->app, bps);
+                                int res = gsend(r->app, bps, NULL, "bps");
+                                if (!res) return 1;
+                            }
+                            u_int32_t pps = get_diff(diffpackets, r, FALSE, "packets");
+                            if (pps != (u_int32_t)(-1) ) {
+                                int res = gsend(r->app, pps, "_packets", "pps");
                                 if (!res) return 1;
                             }
                         }
@@ -543,7 +566,7 @@ main(int argc, char ** argv) {
             cname = argv[2];
             argc-=2; argv+=2;
         } else if (strcmp(argv[1], "-d") == 0) {
-            verv += 1;
+            verb += 1;
             argc-=1; argv+=1;
         } else if (strcmp(argv[1], "-h") == 0) {
             usage();
